@@ -19,6 +19,7 @@ from continual_learner import ContinualLearner
 from exemplars import ExemplarHandler
 from replayer import Replayer
 from param_values import set_default_values
+import itertools
 
 
 parser = argparse.ArgumentParser('./main.py', description='Run individual continual learning experiment.')
@@ -200,6 +201,11 @@ def run(args, verbose=False):
         name=args.experiment, scenario=scenario, tasks=args.tasks, data_dir=args.d_dir,
         verbose=verbose, exception=True if args.seed==0 else False,
     )
+    num_tasks = len(train_datasets)
+    permutations = list(itertools.permutations([*range(num_tasks)], num_tasks))
+    perm_train_datasets = [[i[1] for i in sorted(list(zip(perm, train_datasets)))] for perm in permutations]
+  
+
 
 
     #-------------------------------------------------------------------------------------------------#
@@ -210,29 +216,31 @@ def run(args, verbose=False):
 
     # Define main model (i.e., classifier, if requested with feedback connections)
     if args.feedback:
-        model = AutoEncoder(
+        models = [AutoEncoder(
             image_size=config['size'], image_channels=config['channels'], classes=config['classes'],
             fc_layers=args.fc_lay, fc_units=args.fc_units, z_dim=args.z_dim,
             fc_drop=args.fc_drop, fc_bn=True if args.fc_bn=="yes" else False, fc_nl=args.fc_nl,
-        ).to(device)
-        model.lamda_pl = 1. #--> to make that this VAE is also trained to classify
+        ).to(device) for i in range(len(permutations))]
+        for model in models:
+            model.lamda_pl = 1. #--> to make that this VAE is also trained to classify
     else:
-        model = Classifier(
+        models = [Classifier(
             image_size=config['size'], image_channels=config['channels'], classes=config['classes'],
             fc_layers=args.fc_lay, fc_units=args.fc_units, fc_drop=args.fc_drop, fc_nl=args.fc_nl,
             fc_bn=True if args.fc_bn=="yes" else False, excit_buffer=True if args.xdg and args.gating_prop>0 else False,
             binaryCE=args.bce, binaryCE_distill=args.bce_distill, AGEM=args.agem,
-        ).to(device)
+        ).to(device) for i in range(len(permutations))]
 
     # Define optimizer (only include parameters that "requires_grad")
-    model.optim_list = [{'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr': args.lr}]
-    model.optim_type = args.optimizer
-    if model.optim_type in ("adam", "adam_reset"):
-        model.optimizer = optim.Adam(model.optim_list, betas=(0.9, 0.999))
-    elif model.optim_type=="sgd":
-        model.optimizer = optim.SGD(model.optim_list)
-    else:
-        raise ValueError("Unrecognized optimizer, '{}' is not currently a valid option".format(args.optimizer))
+    for model in models:
+        model.optim_list = [{'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr': args.lr}]
+        model.optim_type = args.optimizer
+        if model.optim_type in ("adam", "adam_reset"):
+            model.optimizer = optim.Adam(model.optim_list, betas=(0.9, 0.999))
+        elif model.optim_type=="sgd":
+            model.optimizer = optim.SGD(model.optim_list)
+        else:
+            raise ValueError("Unrecognized optimizer, '{}' is not currently a valid option".format(args.optimizer))
 
 
     #-------------------------------------------------------------------------------------------------#
@@ -242,10 +250,10 @@ def run(args, verbose=False):
     #----------------------------------#
 
     # Store in model whether, how many and in what way to store exemplars
-    if isinstance(model, ExemplarHandler) and (args.use_exemplars or args.add_exemplars or args.replay=="exemplars"):
-        model.memory_budget = args.budget
-        model.norm_exemplars = args.norm_exemplars
-        model.herding = args.herding
+        if isinstance(model, ExemplarHandler) and (args.use_exemplars or args.add_exemplars or args.replay=="exemplars"):
+            model.memory_budget = args.budget
+            model.norm_exemplars = args.norm_exemplars
+            model.herding = args.herding
 
 
     #-------------------------------------------------------------------------------------------------#
@@ -255,66 +263,67 @@ def run(args, verbose=False):
     #-----------------------------------#
 
     # Elastic Weight Consolidation (EWC)
-    if isinstance(model, ContinualLearner):
-        model.ewc_lambda = args.ewc_lambda if args.ewc else 0
-        if args.ewc:
-            model.fisher_n = args.fisher_n
-            model.gamma = args.gamma
-            model.online = args.online
-            model.emp_FI = args.emp_fi
+        if isinstance(model, ContinualLearner):
+            model.ewc_lambda = args.ewc_lambda if args.ewc else 0
+            if args.ewc:
+                model.fisher_n = args.fisher_n
+                model.gamma = args.gamma
+                model.online = args.online
+                model.emp_FI = args.emp_fi
 
-    # Synpatic Intelligence (SI)
-    if isinstance(model, ContinualLearner):
-        model.si_c = args.si_c if args.si else 0
-        if args.si:
-            model.epsilon = args.epsilon
+        # Synpatic Intelligence (SI)
+        if isinstance(model, ContinualLearner):
+            model.si_c = args.si_c if args.si else 0
+            if args.si:
+                model.epsilon = args.epsilon
 
-    # XdG: create for every task a "mask" for each hidden fully connected layer
-    if isinstance(model, ContinualLearner) and (args.xdg and args.gating_prop>0):
-        mask_dict = {}
-        excit_buffer_list = []
-        for task_id in range(args.tasks):
-            mask_dict[task_id+1] = {}
-            for i in range(model.fcE.layers):
-                layer = getattr(model.fcE, "fcLayer{}".format(i+1)).linear
-                if task_id==0:
-                    excit_buffer_list.append(layer.excit_buffer)
-                n_units = len(layer.excit_buffer)
-                gated_units = np.random.choice(n_units, size=int(args.gating_prop*n_units), replace=False)
-                mask_dict[task_id+1][i] = gated_units
-        model.mask_dict = mask_dict
-        model.excit_buffer_list = excit_buffer_list
+        # XdG: create for every task a "mask" for each hidden fully connected layer
+        if isinstance(model, ContinualLearner) and (args.xdg and args.gating_prop>0):
+            mask_dict = {}
+            excit_buffer_list = []
+            for task_id in range(args.tasks):
+                mask_dict[task_id+1] = {}
+                for i in range(model.fcE.layers):
+                    layer = getattr(model.fcE, "fcLayer{}".format(i+1)).linear
+                    if task_id==0:
+                        excit_buffer_list.append(layer.excit_buffer)
+                    n_units = len(layer.excit_buffer)
+                    gated_units = np.random.choice(n_units, size=int(args.gating_prop*n_units), replace=False)
+                    mask_dict[task_id+1][i] = gated_units
+            model.mask_dict = mask_dict
+            model.excit_buffer_list = excit_buffer_list
 
 
-    #-------------------------------------------------------------------------------------------------#
+        #-------------------------------------------------------------------------------------------------#
 
-    #-------------------------------#
-    #----- CL-STRATEGY: REPLAY -----#
-    #-------------------------------#
+        #-------------------------------#
+        #----- CL-STRATEGY: REPLAY -----#
+        #-------------------------------#
 
-    # Use distillation loss (i.e., soft targets) for replayed data? (and set temperature)
-    if isinstance(model, Replayer):
-        model.replay_targets = "soft" if args.distill else "hard"
-        model.KD_temp = args.temp
+        # Use distillation loss (i.e., soft targets) for replayed data? (and set temperature)
+        if isinstance(model, Replayer):
+            model.replay_targets = "soft" if args.distill else "hard"
+            model.KD_temp = args.temp
 
     # If needed, specify separate model for the generator
     train_gen = True if (args.replay=="generative" and not args.feedback) else False
     if train_gen:
         # -specify architecture
-        generator = AutoEncoder(
+        generators = [AutoEncoder(
             image_size=config['size'], image_channels=config['channels'],
             fc_layers=args.g_fc_lay, fc_units=args.g_fc_uni, z_dim=args.g_z_dim, classes=config['classes'],
             fc_drop=args.fc_drop, fc_bn=True if args.fc_bn=="yes" else False, fc_nl=args.fc_nl,
-        ).to(device)
+        ).to(device) for i in range(len(permutations))]
         # -set optimizer(s)
-        generator.optim_list = [{'params': filter(lambda p: p.requires_grad, generator.parameters()), 'lr': args.lr_gen}]
-        generator.optim_type = args.optimizer
-        if generator.optim_type in ("adam", "adam_reset"):
-            generator.optimizer = optim.Adam(generator.optim_list, betas=(0.9, 0.999))
-        elif generator.optim_type == "sgd":
-            generator.optimizer = optim.SGD(generator.optim_list)
+        for generator in generators:
+            generator.optim_list = [{'params': filter(lambda p: p.requires_grad, generator.parameters()), 'lr': args.lr_gen}]
+            generator.optim_type = args.optimizer
+            if generator.optim_type in ("adam", "adam_reset"):
+                generator.optimizer = optim.Adam(generator.optim_list, betas=(0.9, 0.999))
+            elif generator.optim_type == "sgd":
+                generator.optimizer = optim.SGD(generator.optim_list)
     else:
-        generator = None
+        generators = [None]*len(permutations)
 
 
     #-------------------------------------------------------------------------------------------------#
@@ -326,28 +335,30 @@ def run(args, verbose=False):
     # Get parameter-stamp (and print on screen)
     if verbose:
         print("\nParameter-stamp...")
-    param_stamp = get_param_stamp(
-        args, model.name, verbose=verbose, replay=True if (not args.replay=="none") else False,
-        replay_model_name=generator.name if (args.replay=="generative" and not args.feedback) else None,
+    for model in models:
+        param_stamp = get_param_stamp(
+            args, model.name, verbose=verbose, replay=True if (not args.replay=="none") else False,
+            replay_model_name=generator.name if (args.replay=="generative" and not args.feedback) else None,
     )
 
     # Print some model-characteristics on the screen
     if verbose:
         # -main model
-        utils.print_model_info(model, title="MAIN MODEL")
+        for model in models: utils.print_model_info(model, title="MAIN MODEL")
         # -generator
-        if generator is not None:
+        for generator in generators:
+          if generator is not None:
             utils.print_model_info(generator, title="GENERATOR")
 
     # Prepare for keeping track of statistics required for metrics (also used for plotting in pdf)
     if args.pdf or args.metrics:
         # -define [metrics_dict] to keep track of performance during training for storing & for later plotting in pdf
-        metrics_dict = evaluate.initiate_metrics_dict(n_tasks=args.tasks, scenario=args.scenario)
+        metrics_dict = [evaluate.initiate_metrics_dict(n_tasks=args.tasks, scenario=args.scenario) for i in len(permutations)]
         # -evaluate randomly initiated model on all tasks & store accuracies in [metrics_dict] (for calculating metrics)
         if not args.use_exemplars:
-            metrics_dict = evaluate.intial_accuracy(model, test_datasets, metrics_dict,
+            metrics_dict = [evaluate.intial_accuracy(model, test_datasets, metrics_dict,
                                                     classes_per_task=classes_per_task, scenario=scenario,
-                                                    test_size=None, no_task_mask=False)
+                                                    test_size=None, no_task_mask=False) for model in models]
     else:
         metrics_dict = None
 
@@ -378,15 +389,16 @@ def run(args, verbose=False):
     #---------------------#
 
     # Callbacks for reporting on and visualizing loss
-    generator_loss_cbs = [
-        cb._VAE_loss_cb(log=args.loss_log, visdom=visdom, model=model if args.feedback else generator, tasks=args.tasks,
-                        iters_per_task=args.iters if args.feedback else args.g_iters,
-                        replay=False if args.replay=="none" else True)
-    ] if (train_gen or args.feedback) else [None]
-    solver_loss_cbs = [
-        cb._solver_loss_cb(log=args.loss_log, visdom=visdom, model=model, tasks=args.tasks,
-                           iters_per_task=args.iters, replay=False if args.replay=="none" else True)
-    ] if (not args.feedback) else [None]
+    for model, generator in zip(models, generators):
+        generator_loss_cbs = [
+            cb._VAE_loss_cb(log=args.loss_log, visdom=visdom, model=model if args.feedback else generator, tasks=args.tasks,
+                            iters_per_task=args.iters if args.feedback else args.g_iters,
+                            replay=False if args.replay=="none" else True)
+        ] if (train_gen or args.feedback) else [None]
+        solver_loss_cbs = [
+            cb._solver_loss_cb(log=args.loss_log, visdom=visdom, model=model, tasks=args.tasks,
+                            iters_per_task=args.iters, replay=False if args.replay=="none" else True)
+        ] if (not args.feedback) else [None]
 
     # Callbacks for evaluating and plotting generated / reconstructed samples
     sample_cbs = [
@@ -427,13 +439,18 @@ def run(args, verbose=False):
     # Keep track of training-time
     start = time.time()
     # Train model
-    train_cl(
+    num_tasks = len(train_datasets)
+    permutations = list(itertools.permutations([*range(num_tasks)], num_tasks))
+    
+    
+    for (model, train_datasets) in zip(models, perm_train_datasets):
+        train_cl(
         model, train_datasets, replay_mode=args.replay, scenario=scenario, classes_per_task=classes_per_task,
         iters=args.iters, batch_size=args.batch,
         generator=generator, gen_iters=args.g_iters, gen_loss_cbs=generator_loss_cbs,
         sample_cbs=sample_cbs, eval_cbs=eval_cbs, loss_cbs=generator_loss_cbs if args.feedback else solver_loss_cbs,
         metric_cbs=metric_cbs, use_exemplars=args.use_exemplars, add_exemplars=args.add_exemplars,
-    )
+        )
     # Get total training-time in seconds, and write to file
     if args.time:
         training_time = time.time() - start
@@ -452,31 +469,33 @@ def run(args, verbose=False):
         print("\n\nEVALUATION RESULTS:")
 
     # Evaluate precision of final model on full test-set
-    precs = [evaluate.validate(
-        model, test_datasets[i], verbose=False, test_size=None, task=i+1, with_exemplars=False,
-        allowed_classes=list(range(classes_per_task*i, classes_per_task*(i+1))) if scenario=="task" else None
-    ) for i in range(args.tasks)]
-    average_precs = sum(precs) / args.tasks
-    # -print on screen
-    if verbose:
-        print("\n Precision on test-set{}:".format(" (softmax classification)" if args.use_exemplars else ""))
-        for i in range(args.tasks):
-            print(" - Task {}: {:.4f}".format(i + 1, precs[i]))
-        print('=> Average precision over all {} tasks: {:.4f}\n'.format(args.tasks, average_precs))
+    for model in models:
+        precs = [evaluate.validate(
+            model, test_datasets[i], verbose=False, test_size=None, task=i+1, with_exemplars=False,
+            allowed_classes=list(range(classes_per_task*i, classes_per_task*(i+1))) if scenario=="task" else None
+        ) for i in range(args.tasks)]
+        average_precs = sum(precs) / args.tasks
+        # -print on screen
+        if verbose:
+            print("\n Precision on test-set{}:".format(" (softmax classification)" if args.use_exemplars else ""))
+            for i in range(args.tasks):
+                print(" - Task {}: {:.4f}".format(i + 1, precs[i]))
+            print('=> Average precision over all {} tasks: {:.4f}\n'.format(args.tasks, average_precs))
 
     # -with exemplars
     if args.use_exemplars:
-        precs = [evaluate.validate(
-            model, test_datasets[i], verbose=False, test_size=None, task=i+1, with_exemplars=True,
-            allowed_classes=list(range(classes_per_task*i, classes_per_task*(i+1))) if scenario=="task" else None
-        ) for i in range(args.tasks)]
-        average_precs_ex = sum(precs) / args.tasks
-        # -print on screen
-        if verbose:
-            print(" Precision on test-set (classification using exemplars):")
-            for i in range(args.tasks):
-                print(" - Task {}: {:.4f}".format(i + 1, precs[i]))
-            print('=> Average precision over all {} tasks: {:.4f}\n'.format(args.tasks, average_precs_ex))
+        for model in models:
+            precs = [evaluate.validate(
+                model, test_datasets[i], verbose=False, test_size=None, task=i+1, with_exemplars=True,
+                allowed_classes=list(range(classes_per_task*i, classes_per_task*(i+1))) if scenario=="task" else None
+            ) for i in range(args.tasks)]
+            average_precs_ex = sum(precs) / args.tasks
+            # -print on screen
+            if verbose:
+                print(" Precision on test-set (classification using exemplars):")
+                for i in range(args.tasks):
+                    print(" - Task {}: {:.4f}".format(i + 1, precs[i]))
+                print('=> Average precision over all {} tasks: {:.4f}\n'.format(args.tasks, average_precs_ex))
 
     if args.metrics:
         # Accuracy matrix
